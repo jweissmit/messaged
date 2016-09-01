@@ -1,0 +1,84 @@
+#!/usr/bin/python
+
+MESSAGE_VERS = 'GMS:0'
+# MESSAGE_SIZE used to be 2048, but messages bigger than 1472
+# bytes seem to get lost when crossing (some?) routers, so truncate
+# there instead.
+MESSAGE_SIZE = 1472
+MESSAGE_FILE = '/var/gms/Message'
+
+import argparse, errno, os, socket, sys, syslog
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--log", help="syslog successful transactions",
+                    action="store_true")
+args = parser.parse_args()
+
+syslog.openlog (logoption=syslog.LOG_PID, facility=syslog.LOG_DAEMON)
+s = socket.fromfd(sys.stdin.fileno(), socket.AF_INET, socket.SOCK_DGRAM)
+try:
+    request, address = s.recvfrom(MESSAGE_SIZE)
+    localaddr = s.getsockname()
+    s.close()
+    request = request.rstrip()
+except socket_error as err:
+    syslog.syslog(syslog.LOG_INFO, "GMS daemon socket error reading: {0}".format(err))
+    sys.exit(err.errno)
+else:
+    if args.log:
+        syslog.syslog(syslog.LOG_INFO, "GMS request received successfully [%s] from %s" % (request, address))
+
+if request != MESSAGE_VERS:
+    syslog.syslog(syslog.LOG_INFO, "GMS bogus version [%s] from %s\n" % (request, address))
+    sys.exit(1)
+
+# Fork to avoid issues with waiting inetd
+pid = os.fork()
+if pid:
+    sys.exit(0)
+
+try:
+    s2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s2.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s2.bind(localaddr)
+    s2.connect(address)
+except socket_error as err:
+    syslog.syslog(syslog.LOG_INFO, "GMS daemon socket error connecting for send: {0}".format(err))
+    sys.exit(err.errno)
+
+NO_MESSAGE = False
+try:
+    if os.stat(MESSAGE_FILE).st_size == 0:
+        NO_MESSAGE = True
+except OSError as err:
+    if err.errno != errno.ENOENT:
+        syslog.syslog(syslog.LOG_INFO, "GMS daemon open error reading message file %s: {0}".format(err) % MESSAGE_FILE)
+        sys.exit(err.errno)
+    else:
+        NO_MESSAGE = True
+
+if NO_MESSAGE:
+    try:
+        s2.send ("%s 0\n" % MESSAGE_VERS)
+        s2.close()
+        sys.exit(0)
+    except socket_error as err:
+        syslog.syslog(syslog.LOG_INFO, "GMS daemon socket error sending to %s: {0}".format(err) % address)
+        sys.exit(err.errno)
+else:
+    MESSAGE_FILE_MTIME = int(os.path.getmtime(MESSAGE_FILE))
+    with open(MESSAGE_FILE, 'r') as FD:
+        MESSAGE_FILE_CONTENTS = FD.read()
+    try:
+        msg = "%s %s\n%s" % (MESSAGE_VERS, MESSAGE_FILE_MTIME, MESSAGE_FILE_CONTENTS)
+        msg2 = msg[:MESSAGE_SIZE]
+        if msg2 != msg:
+            # 17 is the size of the header line contianing the GMS
+            # version string and file timestamp.
+            syslog.syslog(syslog.LOG_INFO, "GMS message too long, truncating.  (Keep file under %s bytes.)\n" % (MESSAGE_SIZE - 17))
+        s2.send (msg2)
+        s2.close()
+        sys.exit(0)
+    except socket_error as err:
+        syslog.syslog(syslog.LOG_INFO, "GMS daemon socket error sending to %s: {0}".format(err) % address)
+        sys.exit(err.errno)
